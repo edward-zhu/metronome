@@ -2,6 +2,21 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Play, Square, Plus, Trash2, Activity } from 'lucide-react';
 import './index.css';
 
+const workerCode = `
+  let timerID = null;
+  self.onmessage = function(e) {
+    if (e.data === 'start') {
+      timerID = setInterval(function() {
+        postMessage('tick');
+      }, 25);
+    } else if (e.data === 'stop') {
+      clearInterval(timerID);
+      timerID = null;
+    }
+  };
+`;
+const silentAudioUri = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
 function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [baseBpm, setBaseBpm] = useState(() => {
@@ -39,7 +54,25 @@ function App() {
   const currentBeatRef = useRef(0);
   const currentMeasureRef = useRef(1);
   const currentBpmRef = useRef(baseBpm);
-  const timerIDRef = useRef(null);
+
+  const workerRef = useRef(null);
+  const silentAudioRef = useRef(null);
+  const schedulerRef = useRef(null);
+
+  useEffect(() => {
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    workerRef.current = new Worker(URL.createObjectURL(blob));
+
+    const audio = new Audio(silentAudioUri);
+    audio.loop = true;
+    audio.playsInline = true;
+    silentAudioRef.current = audio;
+
+    return () => {
+      workerRef.current.terminate();
+      audio.pause();
+    };
+  }, []);
 
   const initAudio = () => {
     if (!audioCtxRef.current) {
@@ -120,19 +153,28 @@ function App() {
       scheduleNote(currentBeatRef.current, nextNoteTimeRef.current, currentMeasureRef.current, currentBpmRef.current);
       nextNote();
     }
-    timerIDRef.current = requestAnimationFrame(scheduler);
   };
 
   const isPlayingRef = useRef(isPlaying);
   useEffect(() => {
     isPlayingRef.current = isPlaying;
-  }, [isPlaying]);
+    schedulerRef.current = scheduler;
+
+    if (workerRef.current) {
+      workerRef.current.onmessage = (e) => {
+        if (e.data === 'tick' && schedulerRef.current) {
+          schedulerRef.current();
+        }
+      };
+    }
+  });
 
   const togglePlay = () => {
     if (isPlaying) {
       setIsPlaying(false);
       isPlayingRef.current = false;
-      cancelAnimationFrame(timerIDRef.current);
+      workerRef.current.postMessage('stop');
+      silentAudioRef.current.pause();
     } else {
       initAudio();
       currentBeatRef.current = 0;
@@ -146,7 +188,8 @@ function App() {
 
       setIsPlaying(true);
       isPlayingRef.current = true;
-      scheduler();
+      silentAudioRef.current.play().catch(e => console.log('Silent audio block', e));
+      workerRef.current.postMessage('start');
     }
   };
 
