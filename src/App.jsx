@@ -3,104 +3,90 @@ import { Play, Square, Plus, Trash2, Activity } from 'lucide-react';
 import './index.css';
 
 // ---------------------------------------------------------------------------
-// Pre-render metronome clicks into a WAV blob played by an <audio> element.
-// iOS keeps <audio> alive in the background, so the clicks keep playing even
-// when the screen is off or the user switches apps.
+// Direct PCM generation — much faster than OfflineAudioContext.
+// We only compute sine samples for actual clicks; the rest is zero-filled.
 // ---------------------------------------------------------------------------
 
 const SAMPLE_RATE = 44100;
-const TARGET_DURATION_SEC = 60; // generate up to 10 min of audio
 
-/** Build a timing map: array of { time, beat, measure, bpm } */
-function buildTimingMap(baseBpm, beatsPerMeasure, rules, preRollMeasures) {
-  const map = [];
-  let currentBpm = baseBpm;
-  let time = 0;
-  const startMeasure = preRollMeasures > 0 ? -(preRollMeasures - 1) : 1;
-  let measure = startMeasure;
-
-  while (time < TARGET_DURATION_SEC) {
-    // Apply rule at measure start
-    if (measure > 0) {
-      const rule = rules.find(r => r.measure === measure);
-      if (rule) currentBpm = rule.newBpm;
-    }
-    const secPerBeat = 60.0 / currentBpm;
-    for (let beat = 0; beat < beatsPerMeasure; beat++) {
-      if (time >= TARGET_DURATION_SEC) break;
-      map.push({ time, beat, measure, bpm: currentBpm });
-      time += secPerBeat;
-    }
-    measure++;
-  }
-  return { map, totalDuration: time };
-}
-
-/** Use OfflineAudioContext to render all clicks into an AudioBuffer */
-async function renderClicks(timingMap, totalDuration) {
-  const length = Math.ceil(totalDuration * SAMPLE_RATE);
-  const offCtx = new OfflineAudioContext(1, length, SAMPLE_RATE);
-
-  for (const entry of timingMap) {
-    const t = entry.time;
-    const isPreRoll = entry.measure <= 0;
-    const isAccent = entry.beat === 0;
-
-    const osc = offCtx.createOscillator();
-    const env = offCtx.createGain();
-    osc.type = 'sine';
-
-    if (isPreRoll) {
-      osc.frequency.value = isAccent ? 3000 : 2400;
-      env.gain.setValueAtTime(0.001, t);
-      env.gain.exponentialRampToValueAtTime(0.6, t + 0.001);
-      env.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
-      osc.connect(env); env.connect(offCtx.destination);
-      osc.start(t); osc.stop(t + 0.2);
-    } else {
-      osc.frequency.value = isAccent ? 1200 : 800;
-      env.gain.setValueAtTime(0.001, t);
-      env.gain.exponentialRampToValueAtTime(1.0, t + 0.001);
-      env.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
-      osc.connect(env); env.connect(offCtx.destination);
-      osc.start(t); osc.stop(t + 0.06);
-    }
-  }
-
-  return offCtx.startRendering();
-}
-
-/** Convert an AudioBuffer to a WAV Blob URL */
-function audioBufferToWavUrl(audioBuffer) {
-  const numSamples = audioBuffer.length;
-  const sampleRate = audioBuffer.sampleRate;
-  const channelData = audioBuffer.getChannelData(0);
-  const dataSize = numSamples * 2; // 16-bit
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
+/** Write a WAV header into a DataView */
+function writeWavHeader(view, numSamples, sampleRate) {
+  const dataSize = numSamples * 2;
   const w = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
   w(0, 'RIFF');
   view.setUint32(4, 36 + dataSize, true);
   w(8, 'WAVE'); w(12, 'fmt ');
   view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
+  view.setUint16(20, 1, true);   // PCM
+  view.setUint16(22, 1, true);   // mono
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true);
   view.setUint16(34, 16, true);
   w(36, 'data');
   view.setUint32(40, dataSize, true);
+}
 
-  let offset = 44;
-  for (let i = 0; i < numSamples; i++) {
-    let s = Math.max(-1, Math.min(1, channelData[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    offset += 2;
+/** Stamp a click (sine burst with exponential decay) into an Int16 PCM buffer */
+function stampClick(pcm, startSample, freq, amplitude, decayRate, durationSec) {
+  const clickLen = Math.min(Math.ceil(SAMPLE_RATE * durationSec), pcm.length - startSample);
+  const twoPiF = 2 * Math.PI * freq / SAMPLE_RATE;
+  for (let i = 0; i < clickLen; i++) {
+    const t = i / SAMPLE_RATE;
+    const val = Math.sin(twoPiF * i) * amplitude * Math.exp(-t * decayRate);
+    const sample = val < 0 ? val * 0x8000 : val * 0x7FFF;
+    pcm[startSample + i] = Math.max(-32768, Math.min(32767, pcm[startSample + i] + (sample | 0)));
+  }
+}
+
+/**
+ * Build a timing map and generate a WAV blob URL.
+ *
+ * Strategy:
+ *   - No rules → render 1 measure, loop=true  (tiny, instant)
+ *   - With rules → render pre-roll + all rules + 8 extra measures
+ *   - With pre-roll (no rules) → render pre-roll + 1 regular measure,
+ *     then on `ended` switch to a looped single-measure WAV
+ */
+function generateMeasures(baseBpm, beatsPerMeasure, rules, startMeasure, endMeasure) {
+  const timingMap = [];
+  let currentBpm = baseBpm;
+  let time = 0;
+
+  for (let measure = startMeasure; measure <= endMeasure; measure++) {
+    if (measure > 0) {
+      const rule = rules.find(r => r.measure === measure);
+      if (rule) currentBpm = rule.newBpm;
+    }
+    const secPerBeat = 60.0 / currentBpm;
+    for (let beat = 0; beat < beatsPerMeasure; beat++) {
+      timingMap.push({ time, beat, measure, bpm: currentBpm });
+      time += secPerBeat;
+    }
   }
 
-  return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+  // Generate PCM
+  const totalSamples = Math.ceil(time * SAMPLE_RATE);
+  const buffer = new ArrayBuffer(44 + totalSamples * 2);
+  const view = new DataView(buffer);
+  const pcm = new Int16Array(buffer, 44);
+
+  writeWavHeader(view, totalSamples, SAMPLE_RATE);
+
+  for (const entry of timingMap) {
+    const startSample = Math.round(entry.time * SAMPLE_RATE);
+    const isPreRoll = entry.measure <= 0;
+    const isAccent = entry.beat === 0;
+
+    if (isPreRoll) {
+      stampClick(pcm, startSample, isAccent ? 3000 : 2400, 0.5, 30, 0.2);
+    } else {
+      stampClick(pcm, startSample, isAccent ? 1200 : 800, 0.9, 80, 0.06);
+    }
+  }
+
+  const wavUrl = URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+  return { wavUrl, timingMap, totalDuration: time, finalBpm: timingMap.length > 0 ? timingMap[timingMap.length - 1].bpm : baseBpm };
 }
 
 // ---------------------------------------------------------------------------
@@ -134,14 +120,15 @@ function App() {
   const [displayMeasure, setDisplayMeasure] = useState(1);
   const [displayBeat, setDisplayBeat] = useState(1);
   const [displayBpm, setDisplayBpm] = useState(baseBpm);
-  const [isRendering, setIsRendering] = useState(false);
 
   const audioElRef = useRef(null);       // <audio> element
   const wavUrlRef = useRef(null);        // current WAV blob URL
+  const loopWavUrlRef = useRef(null);    // single-measure loop WAV for after initial plays
   const timingMapRef = useRef([]);       // timing map for visual tracking
-  const rafRef = useRef(null);           // requestAnimationFrame id
+  const rafRef = useRef(null);
   const isPlayingRef = useRef(false);
   const wakeLockRef = useRef(null);
+  const measureCounterRef = useRef(1);   // tracks total measures for visual display when looping
 
   // ── MediaSession (lock-screen metadata) ──
   useEffect(() => {
@@ -154,13 +141,15 @@ function App() {
     }
   }, []);
 
-  // ── Visual tracker: uses rAF + audio.currentTime to find current beat ──
+  // ── Visual tracker ──
   const trackVisuals = useCallback(() => {
     if (!isPlayingRef.current || !audioElRef.current) return;
 
     const t = audioElRef.current.currentTime;
     const map = timingMapRef.current;
-    // Binary-ish search for the last entry whose time <= t
+    if (map.length === 0) { rafRef.current = requestAnimationFrame(trackVisuals); return; }
+
+    // Binary search for the last entry whose time <= t
     let lo = 0, hi = map.length - 1, idx = 0;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
@@ -170,7 +159,9 @@ function App() {
     const entry = map[idx];
     if (entry) {
       setDisplayBeat(entry.beat + 1);
-      setDisplayMeasure(entry.measure);
+      // If we're looping, offset the measure number
+      const measureOffset = measureCounterRef.current - 1;
+      setDisplayMeasure(entry.measure + measureOffset);
       setDisplayBpm(entry.bpm);
     }
     rafRef.current = requestAnimationFrame(trackVisuals);
@@ -191,7 +182,6 @@ function App() {
     if (wakeLockRef.current) { wakeLockRef.current.release().catch(() => { }); wakeLockRef.current = null; }
   };
 
-  // ── Re-acquire wake lock when returning to foreground ──
   useEffect(() => {
     const handler = () => {
       if (document.visibilityState === 'visible' && isPlayingRef.current) requestWakeLock();
@@ -200,61 +190,93 @@ function App() {
     return () => document.removeEventListener('visibilitychange', handler);
   }, []);
 
+  // ── Cleanup blob URLs ──
+  const cleanupUrls = () => {
+    if (wavUrlRef.current) { URL.revokeObjectURL(wavUrlRef.current); wavUrlRef.current = null; }
+    if (loopWavUrlRef.current) { URL.revokeObjectURL(loopWavUrlRef.current); loopWavUrlRef.current = null; }
+  };
+
+  // ── Get or create <audio> element ──
+  const getAudioEl = () => {
+    if (!audioElRef.current) {
+      audioElRef.current = new Audio();
+      audioElRef.current.setAttribute('playsinline', '');
+    }
+    return audioElRef.current;
+  };
+
   // ── Toggle Play/Stop ──
-  const togglePlay = async () => {
+  const togglePlay = () => {
     if (isPlaying) {
       // STOP
       isPlayingRef.current = false;
       setIsPlaying(false);
-      if (audioElRef.current) { audioElRef.current.pause(); audioElRef.current.currentTime = 0; }
+      const audio = audioElRef.current;
+      if (audio) { audio.pause(); audio.currentTime = 0; audio.onended = null; }
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       releaseWakeLock();
+      cleanupUrls();
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-      // free memory
-      if (wavUrlRef.current) { URL.revokeObjectURL(wavUrlRef.current); wavUrlRef.current = null; }
-    } else {
-      // START — render the full metronome audio, then play
-      setIsRendering(true);
-      try {
-        const { map, totalDuration } = buildTimingMap(baseBpm, beatsPerMeasure, rules, preRollMeasures);
-        timingMapRef.current = map;
-
-        const audioBuffer = await renderClicks(map, totalDuration);
-        const wavUrl = audioBufferToWavUrl(audioBuffer);
-
-        // Clean up previous blob
-        if (wavUrlRef.current) URL.revokeObjectURL(wavUrlRef.current);
-        wavUrlRef.current = wavUrl;
-
-        if (!audioElRef.current) {
-          audioElRef.current = new Audio();
-          audioElRef.current.setAttribute('playsinline', '');
-        }
-        audioElRef.current.src = wavUrl;
-        audioElRef.current.loop = false;
-
-        // When audio ends naturally (ran out of pre-rendered audio)
-        audioElRef.current.onended = () => {
-          if (isPlayingRef.current) {
-            isPlayingRef.current = false;
-            setIsPlaying(false);
-            releaseWakeLock();
-          }
-        };
-
-        await audioElRef.current.play();
-
-        isPlayingRef.current = true;
-        setIsPlaying(true);
-        if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-        requestWakeLock();
-        rafRef.current = requestAnimationFrame(trackVisuals);
-      } catch (err) {
-        console.error('Failed to start metronome:', err);
-      } finally {
-        setIsRendering(false);
-      }
+      return;
     }
+
+    // START
+    const startMeasure = preRollMeasures > 0 ? -(preRollMeasures - 1) : 1;
+    const hasRules = rules.length > 0;
+    const maxRuleMeasure = hasRules ? Math.max(...rules.map(r => r.measure)) : 0;
+
+    // Determine how many measures to render for the initial WAV
+    let endMeasure;
+    let willLoop;
+    if (!hasRules && preRollMeasures === 0) {
+      // Simplest case: 1 measure, loop forever
+      endMeasure = 1;
+      willLoop = true;
+    } else if (!hasRules && preRollMeasures > 0) {
+      // Pre-roll then 1 regular measure; after it ends, switch to looped single measure
+      endMeasure = 1;
+      willLoop = false;
+    } else {
+      // Has rules: render through all rules + 8 extra measures at final BPM
+      endMeasure = maxRuleMeasure + 8;
+      willLoop = false;
+    }
+
+    cleanupUrls();
+    const result = generateMeasures(baseBpm, beatsPerMeasure, rules, startMeasure, endMeasure);
+    wavUrlRef.current = result.wavUrl;
+    timingMapRef.current = result.timingMap;
+    measureCounterRef.current = 0; // no offset for initial playback
+
+    // Pre-generate the looped single-measure WAV at final BPM for after initial ends
+    const finalBpm = result.finalBpm;
+    const loopResult = generateMeasures(finalBpm, beatsPerMeasure, [], 1, 1);
+    loopWavUrlRef.current = loopResult.wavUrl;
+
+    const audio = getAudioEl();
+    audio.src = result.wavUrl;
+    audio.loop = willLoop;
+
+    // When initial WAV ends, switch to looping single-measure WAV
+    audio.onended = () => {
+      if (!isPlayingRef.current) return;
+      // Calculate which measure we'd be on now
+      measureCounterRef.current = endMeasure; // offset for visual display
+      timingMapRef.current = loopResult.timingMap;
+      audio.src = loopWavUrlRef.current;
+      audio.loop = true;
+      audio.play().catch(() => { });
+    };
+
+    audio.play().then(() => {
+      isPlayingRef.current = true;
+      setIsPlaying(true);
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+      requestWakeLock();
+      rafRef.current = requestAnimationFrame(trackVisuals);
+    }).catch(err => {
+      console.error('Failed to start metronome:', err);
+    });
   };
 
   // ── Rules management ──
@@ -324,10 +346,8 @@ function App() {
         </div>
       </div>
 
-      <button className={`btn btn-primary ${isPlaying ? 'active' : ''}`} onClick={togglePlay} disabled={isRendering}>
-        {isRendering ? (
-          <><span className="spinner" /> RENDERING...</>
-        ) : isPlaying ? (
+      <button className={`btn btn-primary ${isPlaying ? 'active' : ''}`} onClick={togglePlay}>
+        {isPlaying ? (
           <><Square size={24} /> STOP</>
         ) : (
           <><Play size={24} fill="currentColor" /> START METRONOME</>
