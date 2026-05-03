@@ -9,7 +9,7 @@ import './index.css';
 // ---------------------------------------------------------------------------
 
 const SAMPLE_RATE = 44100;
-const TARGET_DURATION_SEC = 600; // generate up to 10 min of audio
+const TARGET_DURATION_SEC = 60; // generate up to 10 min of audio
 
 /** Build a timing map: array of { time, beat, measure, bpm } */
 function buildTimingMap(baseBpm, beatsPerMeasure, rules, preRollMeasures) {
@@ -149,8 +149,8 @@ function App() {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: 'ChronoBeat', artist: 'Metronome', album: 'Running',
       });
-      navigator.mediaSession.setActionHandler('play', () => {});
-      navigator.mediaSession.setActionHandler('pause', () => {});
+      navigator.mediaSession.setActionHandler('play', () => { });
+      navigator.mediaSession.setActionHandler('pause', () => { });
     }
   }, []);
 
@@ -184,11 +184,11 @@ function App() {
         wakeLockRef.current.addEventListener('release', () => {
           if (isPlayingRef.current && document.visibilityState === 'visible') requestWakeLock();
         });
-      } catch (_) {}
+      } catch (_) { }
     }
   };
   const releaseWakeLock = () => {
-    if (wakeLockRef.current) { wakeLockRef.current.release().catch(() => {}); wakeLockRef.current = null; }
+    if (wakeLockRef.current) { wakeLockRef.current.release().catch(() => { }); wakeLockRef.current = null; }
   };
 
   // ── Re-acquire wake lock when returning to foreground ──
