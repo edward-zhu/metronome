@@ -15,6 +15,40 @@ const workerCode = `
     }
   };
 `;
+
+// Generate a WAV file containing silence of specified duration in seconds.
+// Returns a Blob URL.  This is used by the <audio> element to keep
+// the iOS audio session alive while the app is in the background.
+function generateSilentWavUrl(durationSec = 10) {
+  const sampleRate = 22050;
+  const numSamples = sampleRate * durationSec;
+  const dataSize = numSamples * 2; // 16-bit mono
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);          // chunk size
+  view.setUint16(20, 1, true);           // PCM
+  view.setUint16(22, 1, true);           // mono
+  view.setUint32(24, sampleRate, true);   // sample rate
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);           // block align
+  view.setUint16(34, 16, true);          // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+  // samples are already 0 (silence)
+
+  const blob = new Blob([buffer], { type: 'audio/wav' });
+  return URL.createObjectURL(blob);
+}
+
 // Create a 1-second silent AudioBuffer and loop it inside the AudioContext
 // This is the ONLY reliable way to keep AudioContext alive in iOS background
 function startSilentKeepAlive(audioCtx) {
@@ -70,9 +104,17 @@ function App() {
   const silentSourceRef = useRef(null);
   const schedulerRef = useRef(null);
 
+  // iOS background audio: <audio> element + wake lock refs
+  const silentAudioRef = useRef(null);    // <audio> element for iOS background
+  const silentWavUrlRef = useRef(null);   // Blob URL for the silent WAV
+  const wakeLockRef = useRef(null);       // Screen Wake Lock sentinel
+
   useEffect(() => {
     const blob = new Blob([workerCode], { type: 'application/javascript' });
     workerRef.current = new Worker(URL.createObjectURL(blob));
+
+    // Pre-generate the silent WAV blob URL
+    silentWavUrlRef.current = generateSilentWavUrl(10);
 
     // Register MediaSession so iOS treats us as a media app and grants background rights
     if ('mediaSession' in navigator) {
@@ -96,8 +138,80 @@ function App() {
     return () => {
       workerRef.current.terminate();
       document.removeEventListener('visibilitychange', handleVisibility);
+      if (silentWavUrlRef.current) {
+        URL.revokeObjectURL(silentWavUrlRef.current);
+      }
     };
   }, []);
+
+  // ───── iOS Background Audio: Silent <audio> element ─────
+  // iOS Safari suspends Web Audio API when the page goes to background.
+  // However, a playing <audio> element keeps the audio session alive.
+  // We play a looping silent WAV via <audio>, and pipe it through
+  // the AudioContext so the context stays active.
+  const startBackgroundAudio = () => {
+    if (!silentAudioRef.current) {
+      const audio = new Audio();
+      audio.src = silentWavUrlRef.current;
+      audio.loop = true;
+      audio.volume = 0.01; // near-silent but not zero (iOS may skip zero)
+      // WebKit requires the attribute for background playback
+      audio.setAttribute('playsinline', '');
+      silentAudioRef.current = audio;
+    }
+
+    const audio = silentAudioRef.current;
+    const playPromise = audio.play();
+    if (playPromise) {
+      playPromise.catch(() => {
+        // Autoplay may fail; will retry on next user gesture
+      });
+    }
+
+    // Pipe the <audio> element into the AudioContext to keep it alive.
+    // createMediaElementSource can only be called once per element.
+    if (!audio._connectedToCtx && audioCtxRef.current) {
+      try {
+        const source = audioCtxRef.current.createMediaElementSource(audio);
+        source.connect(audioCtxRef.current.destination);
+        audio._connectedToCtx = true;
+      } catch (_) {
+        // Already connected or not supported – fine, the <audio> still keeps
+        // the session alive on its own.
+      }
+    }
+  };
+
+  const stopBackgroundAudio = () => {
+    if (silentAudioRef.current) {
+      silentAudioRef.current.pause();
+      silentAudioRef.current.currentTime = 0;
+    }
+  };
+
+  // ───── Wake Lock API (prevents screen sleep & background throttling) ─────
+  const requestWakeLock = async () => {
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLockRef.current = await navigator.wakeLock.request('screen');
+        // Re-acquire if released (e.g. tab switch)
+        wakeLockRef.current.addEventListener('release', () => {
+          if (isPlayingRef.current && document.visibilityState === 'visible') {
+            requestWakeLock();
+          }
+        });
+      } catch (_) {
+        // Wake Lock not available or denied
+      }
+    }
+  };
+
+  const releaseWakeLock = () => {
+    if (wakeLockRef.current) {
+      wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+    }
+  };
 
   const initAudio = () => {
     if (!audioCtxRef.current) {
@@ -207,11 +321,16 @@ function App() {
       setIsPlaying(false);
       isPlayingRef.current = false;
       workerRef.current.postMessage('stop');
+      stopBackgroundAudio();
+      releaseWakeLock();
       if ('mediaSession' in navigator) {
         navigator.mediaSession.playbackState = 'paused';
       }
     } else {
       initAudio(); // also starts silent keep-alive inside AudioContext
+      startBackgroundAudio(); // <audio> element keeps iOS audio session alive
+      requestWakeLock();      // prevent screen sleep / background throttling
+
       currentBeatRef.current = 0;
       currentMeasureRef.current = preRollMeasures > 0 ? -(preRollMeasures - 1) : 1;
       currentBpmRef.current = baseBpm;
