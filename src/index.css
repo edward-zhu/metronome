@@ -120,6 +120,81 @@ body {
   transform: scale(1.1);
 }
 
+.bpm-stepper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.stepper-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+.stepper-btn:active:not(:disabled) {
+  background: rgba(139, 92, 246, 0.3);
+  transform: scale(0.92);
+}
+
+.stepper-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.bpm-value-btn {
+  min-width: 80px;
+  height: 48px;
+  border-radius: 12px;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  background: rgba(139, 92, 246, 0.1);
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 1.5rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.bpm-value-btn:active:not(:disabled) {
+  background: rgba(139, 92, 246, 0.25);
+}
+
+.bpm-value-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bpm-inline-input {
+  width: 80px;
+  height: 48px;
+  border-radius: 12px;
+  border: 2px solid var(--primary);
+  background: rgba(0, 0, 0, 0.4);
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 1.5rem;
+  font-weight: 800;
+  text-align: center;
+  outline: none;
+  box-shadow: 0 0 12px var(--primary-glow);
+}
+
 .flex-row {
   display: flex;
   gap: 1rem;

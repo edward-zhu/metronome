@@ -8,6 +8,7 @@ import './index.css';
 // ---------------------------------------------------------------------------
 
 const SAMPLE_RATE = 44100;
+const LOOP_MEASURES = 32; // Generate many measures per WAV to minimize loop-gap frequency
 
 /** Write a WAV header into a DataView */
 function writeWavHeader(view, numSamples, sampleRate) {
@@ -93,6 +94,8 @@ function generateMeasures(baseBpm, beatsPerMeasure, rules, startMeasure, endMeas
 // React App
 // ---------------------------------------------------------------------------
 function App() {
+  const [bpmEditing, setBpmEditing] = useState(false);
+  const [bpmDraft, setBpmDraft] = useState('');
   const [isPlaying, setIsPlaying] = useState(false);
   const [baseBpm, setBaseBpm] = useState(() => {
     const s = localStorage.getItem('chronoBeat_baseBpm');
@@ -129,6 +132,7 @@ function App() {
   const isPlayingRef = useRef(false);
   const wakeLockRef = useRef(null);
   const measureCounterRef = useRef(1);   // tracks total measures for visual display when looping
+  const prevTimeRef = useRef(0);          // previous currentTime, used to detect loop wrap-around
 
   // ── MediaSession (lock-screen metadata) ──
   useEffect(() => {
@@ -149,6 +153,12 @@ function App() {
     const map = timingMapRef.current;
     if (map.length === 0) { rafRef.current = requestAnimationFrame(trackVisuals); return; }
 
+    // Detect loop wrap-around: currentTime jumped backwards significantly
+    if (prevTimeRef.current > 0.1 && t < prevTimeRef.current - 0.05) {
+      measureCounterRef.current += LOOP_MEASURES;
+    }
+    prevTimeRef.current = t;
+
     // Binary search for the last entry whose time <= t
     let lo = 0, hi = map.length - 1, idx = 0;
     while (lo <= hi) {
@@ -159,9 +169,7 @@ function App() {
     const entry = map[idx];
     if (entry) {
       setDisplayBeat(entry.beat + 1);
-      // If we're looping, offset the measure number
-      const measureOffset = measureCounterRef.current - 1;
-      setDisplayMeasure(entry.measure + measureOffset);
+      setDisplayMeasure(entry.measure + measureCounterRef.current);
       setDisplayBpm(entry.bpm);
     }
     rafRef.current = requestAnimationFrame(trackVisuals);
@@ -211,6 +219,7 @@ function App() {
       // STOP
       isPlayingRef.current = false;
       setIsPlaying(false);
+      prevTimeRef.current = 0;
       const audio = audioElRef.current;
       if (audio) { audio.pause(); audio.currentTime = 0; audio.onended = null; }
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -229,16 +238,16 @@ function App() {
     let endMeasure;
     let willLoop;
     if (!hasRules && preRollMeasures === 0) {
-      // Simplest case: 1 measure, loop forever
-      endMeasure = 1;
+      // Simplest case: many measures in one WAV, loop forever
+      endMeasure = LOOP_MEASURES;
       willLoop = true;
     } else if (!hasRules && preRollMeasures > 0) {
-      // Pre-roll then 1 regular measure; after it ends, switch to looped single measure
-      endMeasure = 1;
+      // Pre-roll then many regular measures; after it ends, switch to looped WAV
+      endMeasure = LOOP_MEASURES;
       willLoop = false;
     } else {
-      // Has rules: render through all rules + 8 extra measures at final BPM
-      endMeasure = maxRuleMeasure + 8;
+      // Has rules: render through all rules + many extra measures at final BPM
+      endMeasure = maxRuleMeasure + LOOP_MEASURES;
       willLoop = false;
     }
 
@@ -247,21 +256,23 @@ function App() {
     wavUrlRef.current = result.wavUrl;
     timingMapRef.current = result.timingMap;
     measureCounterRef.current = 0; // no offset for initial playback
+    prevTimeRef.current = 0;
 
-    // Pre-generate the looped single-measure WAV at final BPM for after initial ends
+    // Pre-generate the looped multi-measure WAV at final BPM for after initial ends
     const finalBpm = result.finalBpm;
-    const loopResult = generateMeasures(finalBpm, beatsPerMeasure, [], 1, 1);
+    const loopResult = generateMeasures(finalBpm, beatsPerMeasure, [], 1, LOOP_MEASURES);
     loopWavUrlRef.current = loopResult.wavUrl;
 
     const audio = getAudioEl();
     audio.src = result.wavUrl;
-    audio.loop = willLoop;
+    audio.loop = willLoop; // Use native loop for seamless playback; measure tracking via currentTime wrap detection
 
-    // When initial WAV ends, switch to looping single-measure WAV
+    // When initial (non-looped) WAV ends, switch to looping single-measure WAV
     audio.onended = () => {
       if (!isPlayingRef.current) return;
-      // Calculate which measure we'd be on now
-      measureCounterRef.current = endMeasure; // offset for visual display
+      // Transition to loop WAV; measure counter is incremented via wrap detection in trackVisuals
+      measureCounterRef.current = endMeasure;
+      prevTimeRef.current = 0;
       timingMapRef.current = loopResult.timingMap;
       audio.src = loopWavUrlRef.current;
       audio.loop = true;
@@ -321,7 +332,36 @@ function App() {
 
       <div className="control-group" style={{ marginTop: '2rem' }}>
         <label className="control-label">Base BPM</label>
-        <div className="slider-container">
+        <div className="bpm-stepper">
+          <button className="stepper-btn" onClick={() => setBaseBpm(Math.max(30, baseBpm - 5))} disabled={isPlaying}>-5</button>
+          <button className="stepper-btn" onClick={() => setBaseBpm(Math.max(30, baseBpm - 1))} disabled={isPlaying}>-</button>
+          {bpmEditing ? (
+            <input
+              className="bpm-inline-input"
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              autoFocus
+              value={bpmDraft}
+              onChange={(e) => setBpmDraft(e.target.value.replace(/[^0-9]/g, ''))}
+              onBlur={() => {
+                const v = parseInt(bpmDraft, 10);
+                if (v >= 30 && v <= 300) setBaseBpm(v);
+                setBpmEditing(false);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.target.blur();
+              }}
+            />
+          ) : (
+            <button className="bpm-value-btn" onClick={() => { if (!isPlaying) { setBpmDraft(String(baseBpm)); setBpmEditing(true); } }} disabled={isPlaying}>
+              {baseBpm}
+            </button>
+          )}
+          <button className="stepper-btn" onClick={() => setBaseBpm(Math.min(300, baseBpm + 1))} disabled={isPlaying}>+</button>
+          <button className="stepper-btn" onClick={() => setBaseBpm(Math.min(300, baseBpm + 5))} disabled={isPlaying}>+5</button>
+        </div>
+        <div className="slider-container" style={{ marginTop: '0.75rem' }}>
           <input type="range" className="slider" min="30" max="300" value={baseBpm}
             onChange={(e) => setBaseBpm(parseInt(e.target.value))} disabled={isPlaying} />
         </div>
@@ -341,7 +381,7 @@ function App() {
         </div>
         <div className="flex-1">
           <label className="control-label">Pre-roll Measures</label>
-          <input type="number" min="0" max="10" value={preRollMeasures}
+          <input type="number" inputMode="numeric" pattern="[0-9]*" min="0" max="10" value={preRollMeasures}
             onChange={(e) => setPreRollMeasures(parseInt(e.target.value) || 0)} disabled={isPlaying} />
         </div>
       </div>
@@ -372,13 +412,13 @@ function App() {
             <div key={idx} className="rule-item">
               <div style={{ flex: 1 }}>
                 <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>At Measure</span>
-                <input type="number" min="2" value={rule.measure}
+                <input type="number" inputMode="numeric" pattern="[0-9]*" min="2" value={rule.measure}
                   onChange={(e) => updateRule(idx, 'measure', e.target.value)}
                   style={{ marginTop: '0.2rem', padding: '0.5rem' }} />
               </div>
               <div style={{ flex: 1 }}>
                 <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Change to (BPM)</span>
-                <input type="number" min="30" max="300" value={rule.newBpm}
+                <input type="number" inputMode="numeric" pattern="[0-9]*" min="30" max="300" value={rule.newBpm}
                   onChange={(e) => updateRule(idx, 'newBpm', e.target.value)}
                   style={{ marginTop: '0.2rem', padding: '0.5rem' }} />
               </div>
