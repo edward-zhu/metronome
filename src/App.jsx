@@ -15,7 +15,18 @@ const workerCode = `
     }
   };
 `;
-const silentAudioUri = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+// Create a 1-second silent AudioBuffer and loop it inside the AudioContext
+// This is the ONLY reliable way to keep AudioContext alive in iOS background
+function startSilentKeepAlive(audioCtx) {
+  const bufferSize = audioCtx.sampleRate; // 1 second of silence
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.loop = true;
+  source.connect(audioCtx.destination);
+  source.start(0);
+  return source;
+}
 
 function App() {
   const [isPlaying, setIsPlaying] = useState(false);
@@ -56,21 +67,35 @@ function App() {
   const currentBpmRef = useRef(baseBpm);
 
   const workerRef = useRef(null);
-  const silentAudioRef = useRef(null);
+  const silentSourceRef = useRef(null);
   const schedulerRef = useRef(null);
 
   useEffect(() => {
     const blob = new Blob([workerCode], { type: 'application/javascript' });
     workerRef.current = new Worker(URL.createObjectURL(blob));
 
-    const audio = new Audio(silentAudioUri);
-    audio.loop = true;
-    audio.playsInline = true;
-    silentAudioRef.current = audio;
+    // Register MediaSession so iOS treats us as a media app and grants background rights
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'ChronoBeat',
+        artist: 'Metronome',
+        album: 'Running',
+      });
+      navigator.mediaSession.setActionHandler('play', () => {});
+      navigator.mediaSession.setActionHandler('pause', () => {});
+    }
+
+    // Resume AudioContext when coming back from background
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && audioCtxRef.current) {
+        audioCtxRef.current.resume();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
 
     return () => {
       workerRef.current.terminate();
-      audio.pause();
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
 
@@ -78,9 +103,17 @@ function App() {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
     }
-    if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') {
+      ctx.resume();
     }
+    // Start (or restart) the silent keep-alive source inside the AudioContext.
+    // This is critical for iOS: only audio routed through AudioContext.destination
+    // prevents the context from being suspended in the background.
+    if (silentSourceRef.current) {
+      try { silentSourceRef.current.stop(); } catch (_) {}
+    }
+    silentSourceRef.current = startSilentKeepAlive(ctx);
   };
 
   const scheduleNote = (beatNumber, time, measureNumber, bpmAtThisNote) => {
@@ -174,9 +207,11 @@ function App() {
       setIsPlaying(false);
       isPlayingRef.current = false;
       workerRef.current.postMessage('stop');
-      silentAudioRef.current.pause();
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'paused';
+      }
     } else {
-      initAudio();
+      initAudio(); // also starts silent keep-alive inside AudioContext
       currentBeatRef.current = 0;
       currentMeasureRef.current = preRollMeasures > 0 ? -(preRollMeasures - 1) : 1;
       currentBpmRef.current = baseBpm;
@@ -188,7 +223,9 @@ function App() {
 
       setIsPlaying(true);
       isPlayingRef.current = true;
-      silentAudioRef.current.play().catch(e => console.log('Silent audio block', e));
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'playing';
+      }
       workerRef.current.postMessage('start');
     }
   };
